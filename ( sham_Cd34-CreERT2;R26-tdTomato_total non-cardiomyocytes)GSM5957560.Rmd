@@ -1,0 +1,585 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+#00加载包与数据
+```{r}
+Sys.setenv(language = "en")
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(stringi)
+library(openxlsx)
+library(ggsci)
+library(tibble)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(Seurat)
+library(limma)
+library(magrittr)
+library(celldex)
+library(SingleR)
+library(monocle)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library("biomaRt")
+library(digest)
+library(GOplot)
+library(Seurat)
+library(patchwork)
+library(RColorBrewer)
+library(tidyverse)
+library(reshape2)
+library(ggsci)
+library(ggstatsplot)
+```
+#01读取数据
+```{r}
+#读取all sample的数据
+#Attaching SeuratObject
+#查看一下工作路径
+getwd()
+#将工作路径赋值data_dir，方便后续使用
+data_dir <- "/Users/frankq/Desktop/MyData/pw1 and cardiac adipocytes/( sham_Cd34-CreERT2;R26-tdTomato_total non-cardiomyocytes)GSM5957560"
+
+# Read10X命令读取三个文件，得到一个带行名（基因名）及列名（细胞名）的count的矩阵
+pbmc.matrix <- Read10X(data.dir = data_dir)
+pbmc.matrix[1:5,1:5]
+dim(pbmc.matrix)
+
+#创建Seurat对象
+pbmc<-CreateSeuratObject(counts =pbmc.matrix,min.cells=3, min.features=50)
+pbmc[1:5,1:5]
+dim(pbmc)
+str(pbmc)#Seurat对象结构
+pbmc@assays$RNA@data[1:5,1:5]
+GetAssayData(object = pbmc,slot = "data")[1:5,1:5]#获取表达矩阵的两种方法
+head(pbmc@meta.data)#获取metadata数据
+
+#计算细胞线粒体基因表达比例
+pbmc[["percent.mt"]] <- PercentageFeatureSet(object = pbmc, pattern = "^mt-")
+pdf(file="01.featureViolin.pdf", width=10, height=6)
+VlnPlot(object = pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+##设置过滤条件
+pbmc=subset(x = pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 6500 & percent.mt < 25)    
+pdf(file="01.featureViolin.pdf", width=10, height=6)
+VlnPlot(object = pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+while (!is.null(dev.list()))  dev.off()
+nrow(pbmc@meta.data)
+
+#作图
+pdf(file="01.featureCor.pdf",width=10,height=6)
+plot1 <- FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt",pt.size=1.5)
+plot2 <- FeatureScatter(object = pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",pt.size=1.5)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+#数据标准化
+pbmc <- NormalizeData(object = pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#识别高变基因
+pbmc <- FindVariableFeatures(object = pbmc, selection.method = "vst", nfeatures = 2500)##1500 2000 2500？
+top10 <- head(x = VariableFeatures(object = pbmc), 10)
+pdf(file="01.featureVar-2500.pdf",width=10,height=6)
+plot1 <- VariableFeaturePlot(object = pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+#saveRDS(pbmc,file = "01.pbmc.rds")
+```
+#02主成分分析PCA
+```{r}
+#remove(list=ls())
+#data_dir <- "/Users/frankq/Desktop/Mice sequence of BAPN/BAPN"
+#pbmc<-readRDS("01.pbmc.rds")
+pbmc=ScaleData(pbmc)
+pbmc=RunPCA(object= pbmc,npcs = 20,pc.genes=VariableFeatures(object = pbmc)) 
+pdf(file="02.pcaGene.pdf",width=10,height=12)
+VizDimLoadings(object = pbmc, dims = 1:5, reduction = "pca",nfeatures = 20)
+while (!is.null(dev.list()))  dev.off()
+
+pdf(file="02.PCA.pdf",width=6.5,height=6)
+DimPlot(object = pbmc, reduction = "pca")
+while (!is.null(dev.list()))  dev.off()
+
+pdf(file="02.pcaHeatmap.pdf",width=10,height=8)
+DimHeatmap(object = pbmc, dims = 1:15, cells = 500, balanced = TRUE,nfeatures = 30,ncol=2)
+while (!is.null(dev.list()))  dev.off()
+
+pbmc <- JackStraw(object = pbmc, num.replicate = 100)
+pbmc <- ScoreJackStraw(object = pbmc, dims = 1:15)
+pdf(file="02.pcaJackStraw.pdf",width=8,height=6)
+JackStrawPlot(object = pbmc, dims = 1:15)
+while (!is.null(dev.list()))  dev.off()
+
+pdf(file="02.pcaElbowPlot.pdf",width=8,height=6)
+ElbowPlot(object = pbmc)
+while (!is.null(dev.list()))  dev.off()
+
+#saveRDS(pbmc,file = "02.pbmc.rds")
+```
+#03非线性降维TSNE
+```{r}
+remove(list=ls())
+data_dir <- "/Users/frankq/Desktop/Mice sequence of BAPN/BAPN"
+pbmc<-readRDS("02.pbmc.rds")
+pcSelect=14
+pbmc <- FindNeighbors(object = pbmc, dims = 1:pcSelect)
+pbmc <- FindClusters(object = pbmc, resolution = 1)
+pbmc <- RunTSNE(object = pbmc, dims = 1:pcSelect,check_duplicates = FALSE)            
+pdf(file="03.TSNE.pdf",width=5.5,height=5)
+TSNEPlot(object = pbmc, pt.size = 0.5, label = TRUE)  
+while (!is.null(dev.list()))  dev.off()
+write.table(pbmc$seurat_clusters,file="03.tsneCluster.txt",quote=F,sep="\t",col.names=F)
+write.table(Embeddings(object = pbmc[["tsne"]]),file="03.tsneaxis.txt",quote=F,sep="\t",col.names=T)
+logFCfilter=1               
+adjPvalFilter=0.05  
+pbmc.markers <- FindAllMarkers(object = pbmc,
+                               only.pos = FALSE,
+                               min.pct = 0.25,
+                               logfc.threshold = logFCfilter)
+sig.markers=pbmc.markers[(abs(as.numeric(as.vector(pbmc.markers$avg_log2FC)))>logFCfilter & as.numeric(as.vector(pbmc.markers$p_val_adj))<adjPvalFilter),]
+write.table(sig.markers,file="03.clusterMarkers.txt",sep="\t",row.names=F,quote=F)
+top10 <- pbmc.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+pdf(file="03.tsneHeatmap.pdf",width=25,height=18)
+DoHeatmap(object = pbmc, features = top10$gene) + NoLegend()
+while (!is.null(dev.list()))  dev.off()
+pdf(file="03.markerViolin.pdf",width=10,height=6)
+VlnPlot(object = pbmc, features = row.names(sig.markers)[1:2])
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Peg3")
+pdf(file="03.Peg3_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red','red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dcn")
+pdf(file="03.Dcn_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Pecam1")
+pdf(file="03.Pecam1_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Acta2")
+pdf(file="03.Acta2_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Ptprc")
+pdf(file="03.Ptprc_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Icam1")
+pdf(file="03.Icam1_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("F3")
+pdf(file="03.F3_gene.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Peg3","Dpp4","Cd55","Icam1","F3","Fmo2","Adam12","Col4a1","Sparcl1","Pparg","Cebpa")
+pdf(file="03.markerBubble.pdf",width=10,height=6)
+cluster10Marker=showGenes
+DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey",'red'))
+while (!is.null(dev.list()))  dev.off()
+
+#saveRDS(pbmc,file = "03.pbmc.rds")
+```
+
+##04非线性降维UMAP,r=1
+```{r}
+#remove(list=ls())
+#data_dir <- "/Users/frankq/Desktop/Mice sequence of BAPN/BAPN"
+#pbmc<-readRDS("02.pbmc.rds")
+pcSelect=14
+pbmc <- FindNeighbors(object = pbmc, dims = 1:pcSelect)
+pbmc <- FindClusters(object = pbmc, resolution = 1)
+pbmc <- RunUMAP(object = pbmc, dims = 1:pcSelect,check_duplicates = FALSE)            
+pdf(file="04.UMAP_r=1——2500.pdf",width=5.5,height=5)
+UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE,cols = c("#55b7e6","#ed6e69","#98C7A5","#83C180","#B2A4A5","#EC8D63","#CFC397","#F6B279","#6197B4","#CEA168","#A0A783","#9ACC90","#6A9A52","#639FB0","#DE4247","#A38CBD","#795FA3","#E0C880","#C28B65","#A65A34","#DE4B3F","#DD9E82","#E78B75","#F7A96C"))   
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Pdgfra")
+pdf(file="04.Pdgfra_gene.pdf",width=5.5,height = 5)
+FeaturePlot(object =pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,) 
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Pdgfrb")
+pdf(file="04.Pdgfrb_gene.pdf",width=5.5,height = 5)
+FeaturePlot(object =pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,) 
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Peg3")
+pdf(file="04.Peg3_gene.pdf",width=5.5,height = 5)
+FeaturePlot(object =pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,) 
+while (!is.null(dev.list()))  dev.off()
+
+#showGenes=c("Cd3d")
+#pdf(file="04.Cd3d_gene.pdf",width=5.5,height = 5)
+#FeaturePlot(object =pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,) 
+#while (!is.null(dev.list()))  dev.off()
+
+write.table(pbmc$seurat_clusters,file="04.umapCluster_r=1.txt",quote=F,sep="\t",col.names=F)
+write.table(Embeddings(object = pbmc[["umap"]]),file="04.umapaxis_r=1.txt",quote=F,sep="\t",col.names=T)
+
+logFCfilter=1               
+adjPvalFilter=0.05  
+pbmc.markers <- FindAllMarkers(object = pbmc,
+                               only.pos = FALSE,
+                               min.pct = 0.25,
+                               logfc.threshold = logFCfilter)
+
+sig.markers=pbmc.markers[(abs(as.numeric(as.vector(pbmc.markers$avg_log2FC)))>logFCfilter & as.numeric(as.vector(pbmc.markers$p_val_adj))<adjPvalFilter),]
+
+write.table(sig.markers,file="04.clusterMarkers_r=1.txt",sep="\t",row.names=F,quote=F)
+top10 <- pbmc.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+pdf(file="04.umapHeatmap_r=1.pdf",width=25,height=18)
+DoHeatmap(object = pbmc, features = top10$gene) + NoLegend()
+while (!is.null(dev.list()))  dev.off()
+
+pdf(file="04.markerViolin_r=1.pdf",width=10,height=6)
+VlnPlot(object = pbmc, features = row.names(sig.markers)[1:2])
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cd79a","Ly6d","Cd79b","H2-DMb2","Ms4a1","H2-Ob","Fcmr","Ccr7","Bank1","Cd55")
+pdf(file="04.B_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Lgals3","Napsa","Plbd1","Ccr2","Rnase6","Plac8","Ifitm6","Naaa","Ear2","H2afy")
+pdf(file="04.DC_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Ly6c1","Egfl7","Gpihbp1","Cdh5","Mgll","Slc9a3r2","Emcn","Kdr","Pecam1","Rgcc")
+pdf(file="04.Endothelial_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Lamc1","Pcsk6","Pdgfra","Entpd2","Dpep1","Adamts5","Medag","Ms4a4d","Lamb1","Tcf21")
+pdf(file="04.Fibroblasts1_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dkk3","Tbx20","Wif1","Frzb","Meox1","Prg4","Abi3bp","Pdgfrl","Mdk","Gstm5")
+pdf(file="04.Fibroblasts2_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("S100a8","S100a9","Slpi","Csf3r","Hcar2","Lmnb1","Retnlg","Hdc","Clec4d","Hp")
+pdf(file="04.Granulocytes_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dab2","Adgre1","Mgl2","Mrc1","Hpgd","P2ry6","C3ar1","F13a1","Maf","Ms4a7")
+pdf(file="04.Macrophages_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Ccl5","Nkg7","Klrk1","Klre1","Klrd1","Ncr1","Ctsw","Klrb1c","Gzma","Gzmb")
+pdf(file="04.NK_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Kcnj8","Vtn","Colec11","Steap4","Abcc9","Myo1b","Cog7","P2ry14","Heyl","Gnb4")
+pdf(file="04.Pericytes_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Plp1","Kcna1","Cnp","S100b","Gfra3","Gpr37l1","Nrn1","Aspa","Cd59a","Stmn1")
+pdf(file="04.Schwann_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Tagln","Mustn1","Myh11","Mylk","Pcp4l1","Sncg","Lmod1","Des","Pln","Nrip2")
+pdf(file="04.SMC_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Ctg3","Cd3d","Lat","Cd3e","Skap1","Il7r","Lef1","Cd247","Tcf7","Itk")
+pdf(file="04.T_cell_markerScatter.pdf",width=40,height = 15)
+plot1<-UMAPPlot(object = pbmc, pt.size = 0.5, label = TRUE) 
+plot2<-FeaturePlot(object = pbmc, features = showGenes, cols = c("grey",'red'),pt.size = 0.5,order = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+while (!is.null(dev.list()))  dev.off()
+
+#showGenes=c("Cd79a","Ly6d","Cd79b","H2-DMb2","Ms4a1","H2-Ob","Fcmr","Ccr7","Bank1","Cd55","Lgals3","Napsa","Plbd1","Ccr2","Rnase6","Plac8","Ifitm6","Naaa","Ear2","H2afy","Ly6c1","Egfl7","Gpihbp1","Cdh5","Mgll","Slc9a3r2","Emcn","Kdr","Pecam1","Fabp4","Aplnr","Rgcc","Lamc1","Pcsk6","Pdgfra","Entpd2","Dpep1","Adamts5","Medag","Ms4a4d","Lamb1","Tcf21","Dkk3","Tbx20","Wif1","Frzb","Meox1","Prg4","Abi3bp","Pdgfrl","Mdk","Gstm5","S100a8","S100a9","Slpi","Csf3r","Hcar2","Lmnb1","Hdc","Clec4d","Dab2","Adgre1","Mgl2","Mrc1","Hpgd","P2ry6","C3ar1","F13a1","Maf","Ms4a7","Ccl5","Nkg7","Klrk1","Klre1","Klrd1","Ncr1","Ctsw","Klrb1c","Gzma","Gzmb","Kcnj8","Vtn","Colec11","Steap4","Abcc9","Myo1b","Cog7","P2ry14","Heyl","Gnb4","Cspg4","Notch3","Plp1","Kcna1","Cnp","S100b","Gfra3","Gpr37l1","Nrn1","Aspa","Cd59a","Stmn1","Tagln","Mustn1","Myh11","Mylk","Pcp4l1","Sncg","Lmod1","Des","Pln","Nrip2","Cd3d","Lat","Skap1","Il7r","Lef1","Cd247","Tcf7","Itk","Npr3","Gata4","Prox1","Lyve1","Flt4","Pdpn","Msln","Gja5","Plvap","Cdh11")
+#pdf(file="04.all_markerBubble_r=1.pdf",width=32,height=10)
+#cluster10Marker=showGenes
+#DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey","grey","red",'red','red'))+
+ # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+#while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cd79a","Ms4a1","Cd79b","Cdh5","Pecam1","Fabp4","Pdgfra","Col1a1","Col1a2","Fcgr1","Cd68","Itgam","Pdgfrb","Cspg4","Notch3","Acta2","Tagln","Myh11","Plp1","Kcna1","Cnp","Npr3","Plvap","Cdh11","Prox1","Lyve1","Flt4")
+pdf(file="04.all_markerBubble_r=1.pdf",width=10,height=6)
+cluster10Marker=showGenes
+DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey","grey","red",'red','red'))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Peg3")
+pdf(file="04.Peg3_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dcn")
+pdf(file="04.Dcn_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Icam1")
+pdf(file="04.Icam1_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("F3")
+pdf(file="04.F3_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dpp4")
+pdf(file="04.Dpp4_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cd55")
+pdf(file="04.Cd55_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cebpa")
+pdf(file="04.Cebpa_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cd24a")
+pdf(file="04.Cd24a_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Pdgfa")
+pdf(file="04.Pdgfa_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Pdgfb")
+pdf(file="04.Pdgfb_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Cebpb")
+pdf(file="04.Cebpb_gene_r=1.pdf",width=5,height = 5)
+FeaturePlot(object = pbmc, features = showGenes, cols = c("grey","orange",'red'),pt.size = 0.5,
+            order = TRUE)
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Peg3","Dpp4","Cd55","Icam1","F3","Fmo2","Adam12","Col4a1","Sparcl1","Pparg","Cebpa")
+pdf(file="04.markerBubble_r=1.pdf",width=10,height=6)
+cluster10Marker=showGenes
+DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey","grey","grey","orange",'red','red'))
+while (!is.null(dev.list()))  dev.off()
+
+saveRDS(pbmc,file = "04.pbmc.rds")
+
+
+#细胞注释(不推荐自动注释，手动：了解细胞marker的过程)
+new.cluster.ids <- c("Fibroblasts","Fibroblasts","Fibroblasts","Coronary ECs","Coronary ECs","Macrophages","Macrophages","Fibroblasts","Fibroblasts","Coronary ECs","Smooth muscle cell","Macrophages","Fibroblasts","Pericytes","Lymphatic ECs","Schwan cells","Macrophages","Endocardium","B cells","Macrophages")
+names(new.cluster.ids) <- levels(pbmc)
+## 细胞分群的重命名
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+pdf(file="05.UMAP_named.pdf",width=7.5,height=5)
+DimPlot(pbmc,label.size = 2,label = T,repel = T,cols = c("#98C7A5","#ed6e69","#795FA3","#55b7e6","#EC8D63","#CFC397","#6197B4","#A65A34","#B2A4A5"))
+
+showGenes=c("Cd79a","Ms4a1","Cd79b","Npr3","Plvap","Cdh11","Plp1","Kcna1","Cnp","Prox1","Lyve1","Flt4","Pdgfrb","Cspg4","Notch3","Acta2","Tagln","Myh11","Fcgr1","Cd68","Itgam","Cdh5","Pecam1","Fabp4","Pdgfra","Col1a1","Col1a2")
+pdf(file="05.markerBubble_r=1.pdf",width=10,height=4)
+cluster10Marker=showGenes
+DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey","red",'red','red'))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+while (!is.null(dev.list()))  dev.off()
+
+showGenes=c("Dcn","Fn1","Col1a1","Postn","Pecam1","Cdh5","Vwf","Nos3","Ptprc","Cd68","Itgam","Myl9","Myocd","Acta2","Tagln")
+pdf(file="05.markerBubble-1_r=1.pdf",width=10,height=2.5)
+cluster10Marker=showGenes
+DotPlot(object = pbmc, features = cluster10Marker)+ scale_color_gradientn(colours = c("grey","grey","grey","red",'red','red'))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+while (!is.null(dev.list()))  dev.off()
+```
+
+#05提取pdgfra、pdgfrb细胞
+```{r}
+pbmc_pdgfra<-subset(pbmc,subset=Pdgfra>0,slot="counts")
+pbmc_pdgfrb<-subset(pbmc,subset=Pdgfrb>0,slot="counts")
+```
+#06 以Peg3表达量高低在Pdgfra阳性细胞里拉DEG
+```{r}
+highCells=colnames(subset(x = pbmc_pdgfra, subset = Peg3 > 0, slot = 'counts'))
+highORlow=ifelse(colnames(pbmc_pdgfra) %in% highCells,'high','low')
+table(highORlow)
+pbmc_pdgfra@meta.data$highORlow=highORlow
+markers <- FindMarkers(pbmc_pdgfra, ident.1 = "high", 
+                       group.by = 'highORlow', 
+                       subset.ident = "0")
+head(x = markers)
+write.table(markers,file="06.DEG_Pdgfra+Peg3+.txt",quote=F,sep="\t",col.names=T)
+gene<-read.csv("06.DEG_Pdgfra+Peg3+.csv")
+colnames(gene)[1] <- "SYMBOL"
+gene = gene %>% distinct(SYMBOL,.keep_all = T) %>% as.tibble() %>%
+  column_to_rownames(var = "SYMBOL")
+name <- bitr(rownames(gene), fromType = "SYMBOL", toType = "ENSEMBL",OrgDb = "org.Mm.eg.db")
+colnames(gene)[7] <- c("SYMBOL")
+gene[7]<-rownames(gene)
+gene<-merge(gene,name,by="SYMBOL")
+gene<-gene[!is.na(gene$log2FoldChange),]
+name <- bitr(rownames(gene), fromType = "SYMBOL", toType = "ENTREZID",  OrgDb = "org.Mm.eg.db")
+gene<-merge(gene,name,by="SYMBOL")
+#GO富集分析
+Go<-enrichGO(gene       =gene$ENSEMBL,
+                 OrgDb      = org.Mm.eg.db,
+                 keyType    = 'ENSEMBL',
+                 ont        = "all",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.05)
+write.table(Go,file="06.GO.txt",sep="\t",quote=F,row.names = F) 
+#柱状图
+pdf(file="06.GObarplot.pdf",width = 10,height = 12)
+barplot(Go, drop = TRUE, showCategory =10,split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale='free')
+while (!is.null(dev.list()))  dev.off()
+ 
+#气泡图
+pdf(file="06.GObubble.pdf",width = 10,height = 14)
+dotplot(Go,showCategory = 10,split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale='free')
+while (!is.null(dev.list()))  dev.off()
+
+#KEGG富集分析
+
+library(stringr)
+Kegg<-enrichKEGG(gene =gene$ENTREZID,
+               organism = 'mmu',
+               pvalueCutoff = 0.5)
+
+write.table(Kegg,file="06.KEGGId.txt",sep="\t",quote=F,row.names = F)                          #保存富集结果
+#柱状图
+pdf(file="06.KEGGbarplot.pdf",width = 10,height = 15)
+barplot(Kegg, drop = TRUE, showCategory = 30)
+dev.off()
+#气泡图
+pdf(file="06.KEGGbubble.pdf",width = 10,height = 15)
+dotplot(Kegg, showCategory = 30)
+dev.off()
+
+
+```
+#07 以peg3表达量高低在Pdgfrb阳性细胞里拉DEG
+```{r}
+highCells=colnames(subset(x = pbmc_pdgfrb, subset = Peg3 > 0, slot = 'counts'))
+highORlow=ifelse(colnames(pbmc_pdgfrb) %in% highCells,'high','low')
+table(highORlow)
+pbmc_pdgfrb@meta.data$highORlow=highORlow
+markers <- FindMarkers(pbmc_pdgfrb, ident.1 = "high", 
+                       group.by = 'highORlow', 
+                       subset.ident = "0")
+head(x = markers)
+write.csv(markers,file="07.DEG_Pdgfrb+Peg3+.csv",quote=F,sep="\t",col.names=T)
+gene<-read.csv("07.DEG_Pdgfrb+Peg3+.csv")
+colnames(gene)[1] <- "SYMBOL"
+gene = gene %>% distinct(SYMBOL,.keep_all = T) %>% as.tibble() %>%
+  column_to_rownames(var = "SYMBOL")
+name <- bitr(rownames(gene), fromType = "SYMBOL", toType = "ENSEMBL",OrgDb = "org.Mm.eg.db")
+colnames(gene)[6] <- c("SYMBOL")
+gene<-merge(gene,name,by="SYMBOL")
+
+name <- bitr(rownames(gene), fromType = "SYMBOL", toType = "ENTREZID",  OrgDb = "org.Mm.eg.db")
+gene<-merge(gene,name,by="SYMBOL")
+#GO富集分析
+Go<-enrichGO(gene       =gene$ENSEMBL,
+                 OrgDb      = org.Mm.eg.db,
+                 keyType    = 'ENSEMBL',
+                 ont        = "all",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.05)
+write.table(Go,file="07.GO.txt",sep="\t",quote=F,row.names = F) 
+#柱状图
+pdf(file="07.GObarplot.pdf",width = 10,height = 12)
+barplot(Go, drop = TRUE, showCategory =10,split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale='free')
+while (!is.null(dev.list()))  dev.off()
+ 
+#气泡图
+pdf(file="07.GObubble.pdf",width = 10,height = 14)
+dotplot(Go,showCategory = 10,split="ONTOLOGY") + facet_grid(ONTOLOGY~., scale='free')
+while (!is.null(dev.list()))  dev.off()
+
+#KEGG富集分析
+
+library(stringr)
+Kegg<-enrichKEGG(gene =gene$ENTREZID,
+               organism = 'mmu',
+               pvalueCutoff = 0.5)
+
+write.table(Kegg,file="07.KEGGId.txt",sep="\t",quote=F,row.names = F)                          #保存富集结果
+#柱状图
+pdf(file="07.KEGGbarplot.pdf",width = 10,height = 15)
+barplot(Kegg, drop = TRUE, showCategory = 30)
+dev.off()
+#气泡图
+pdf(file="07.KEGGbubble.pdf",width = 10,height = 15)
+dotplot(Kegg, showCategory = 30)
+dev.off()
+```
+
